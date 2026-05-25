@@ -1,0 +1,1 @@
+"""Quickwit MCP server package."""
