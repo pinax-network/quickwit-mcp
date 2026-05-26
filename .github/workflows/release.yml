@@ -1,0 +1,89 @@
+# .github/workflows/release.yml
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    outputs:
+      version_matches: ${{ steps.check.outputs.matches }}
+      version: ${{ steps.tag.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get tag version
+        id: tag
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$TAG_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Get pyproject.toml version
+        id: pyproject
+        run: |
+          PYPROJECT_VERSION=$(grep -m1 'version = ' pyproject.toml | cut -d'"' -f2)
+          echo "version=$PYPROJECT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Compare versions
+        id: check
+        run: |
+          if [ "${{ steps.tag.outputs.version }}" == "${{ steps.pyproject.outputs.version }}" ]; then
+            echo "matches=true" >> $GITHUB_OUTPUT
+            echo "Version matches: ${{ steps.tag.outputs.version }}"
+          else
+            echo "matches=false" >> $GITHUB_OUTPUT
+            echo "Version mismatch!"
+            echo "Tag version: ${{ steps.tag.outputs.version }}"
+            echo "pyproject.toml version: ${{ steps.pyproject.outputs.version }}"
+            exit 1
+          fi
+
+  build-and-push:
+    needs: version-check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern=v{{version}}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
