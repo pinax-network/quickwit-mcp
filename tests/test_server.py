@@ -10,6 +10,7 @@ def test_build_settings_defaults():
     settings = build_settings([])
 
     assert settings.quickwit_base_url == "http://localhost:7280"
+    assert settings.mcp_host == "127.0.0.1"
     assert settings.mcp_port == 8080
 
 
@@ -17,11 +18,14 @@ def test_build_settings_accepts_cli_overrides():
     settings = build_settings([
         "--quickwit-base-url",
         "http://quickwit.vpn:7280/",
+        "--host",
+        "0.0.0.0",
         "--port",
         "9090",
     ])
 
     assert settings.quickwit_base_url == "http://quickwit.vpn:7280"
+    assert settings.mcp_host == "0.0.0.0"
     assert settings.mcp_port == 9090
 
 
@@ -32,11 +36,17 @@ def quickwit_transport(request: httpx.Request) -> httpx.Response:
             json=[
                 {
                     "version": "0.9",
-                    "index_id": "k8s-logs",
-                    "index_uri": "s3://quickwit/indexes/k8s-logs",
-                    "doc_mapping": {"timestamp_field": "timestamp"},
-                    "search_settings": {"default_search_fields": ["message"]},
-                    "extra": {"nested": "value"},
+                    "index_uid": "k8s-logs:01KFKY0ZE5WZPZY50NHQTMT3RZ",
+                    "index_config": {
+                        "version": "0.9",
+                        "index_id": "k8s-logs",
+                        "index_uri": "s3://quickwit/indexes/k8s-logs",
+                        "doc_mapping": {"timestamp_field": "timestamp"},
+                        "search_settings": {"default_search_fields": ["message"]},
+                    },
+                    "checkpoint": {},
+                    "create_timestamp": 1777958213,
+                    "sources": [],
                 }
             ],
         )
@@ -48,8 +58,6 @@ def quickwit_transport(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"num_hits": 0, "hits": [], "errors": []})
     if request.url.path == "/api/v1/indexes/k8s-logs/splits":
         return httpx.Response(200, json={"offset": 0, "size": 0, "splits": []})
-    if request.url.path == "/api/v1/k8s-logs/delete-tasks":
-        return httpx.Response(200, json=[])
     return httpx.Response(404, json={"message": f"unexpected path {request.url.path}"})
 
 
@@ -64,7 +72,7 @@ async def test_create_mcp_exposes_only_curated_tools():
         tools = await mcp_client.list_tools()
 
     tool_names = {tool.name for tool in tools}
-    assert tool_names == {"describe_index", "get_delete_tasks", "list_indexes", "list_splits", "search", "version"}
+    assert tool_names == {"describe_index", "list_indexes", "list_splits", "search", "version"}
     assert "metrics" not in tool_names
     assert "debug" not in tool_names
     assert "node_config" not in tool_names
@@ -82,14 +90,57 @@ async def test_list_indexes_simplifies_real_metadata_shape():
     async with Client(transport=mcp) as mcp_client:
         result = await mcp_client.call_tool("list_indexes", {})
 
+    assert result.structured_content["indexes"][0]["summary"] == {
+        "index_id": "k8s-logs",
+        "index_uri": "s3://quickwit/indexes/k8s-logs",
+        "version": "0.9",
+        "timestamp_field": "timestamp",
+        "default_search_fields": ["message"],
+    }
+    assert result.structured_content["indexes"][0]["raw_metadata"] == {
+        "version": "0.9",
+        "index_uid": "k8s-logs:01KFKY0ZE5WZPZY50NHQTMT3RZ",
+        "index_config": {
+            "version": "0.9",
+            "index_id": "k8s-logs",
+            "index_uri": "s3://quickwit/indexes/k8s-logs",
+            "doc_mapping": {"timestamp_field": "timestamp"},
+            "search_settings": {"default_search_fields": ["message"]},
+        },
+        "checkpoint": {},
+        "create_timestamp": 1777958213,
+        "sources": [],
+    }
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_indexes_extracts_index_id_from_index_uid_without_index_config():
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexes":
+            return httpx.Response(200, json=[{"version": "0.9", "index_uid": "k8s-logs:01ABC"}])
+        return httpx.Response(404, json={"message": f"unexpected path {request.url.path}"})
+
+    settings = build_settings([])
+    client = httpx.AsyncClient(base_url="http://quickwit.example", transport=httpx.MockTransport(transport))
+    mcp = create_mcp(client, settings)
+
+    assert mcp is not None
+    async with Client(transport=mcp) as mcp_client:
+        result = await mcp_client.call_tool("list_indexes", {})
+
     assert result.structured_content == {
         "indexes": [
             {
-                "index_id": "k8s-logs",
-                "index_uri": "s3://quickwit/indexes/k8s-logs",
-                "version": "0.9",
-                "timestamp_field": "timestamp",
-                "default_search_fields": ["message"],
+                "summary": {
+                    "index_id": "k8s-logs",
+                    "index_uri": None,
+                    "version": "0.9",
+                    "timestamp_field": None,
+                    "default_search_fields": [],
+                },
+                "raw_metadata": {"version": "0.9", "index_uid": "k8s-logs:01ABC"},
             }
         ]
     }
@@ -114,6 +165,40 @@ async def test_search_caps_max_hits():
         await mcp_client.call_tool("search", {"index_id": "k8s-logs", "query": "*", "max_hits": 1000})
 
     assert f'"max_hits":{MAX_SEARCH_HITS}' in captured["body"].replace(" ", "")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_accepts_typed_advanced_params():
+    captured = {}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.read().decode()
+        return httpx.Response(200, json={"num_hits": 0, "hits": [], "errors": []})
+
+    settings = build_settings([])
+    client = httpx.AsyncClient(base_url="http://quickwit.example", transport=httpx.MockTransport(transport))
+    mcp = create_mcp(client, settings)
+
+    assert mcp is not None
+    async with Client(transport=mcp) as mcp_client:
+        await mcp_client.call_tool(
+            "search",
+            {
+                "index_id": "k8s-logs",
+                "query": "error",
+                "search_field": ["message"],
+                "snippet_fields": ["message"],
+                "sort_by": ["-timestamp"],
+                "aggs": {"levels": {"terms": {"field": "level"}}},
+            },
+        )
+
+    body = captured["body"].replace(" ", "")
+    assert '"search_field":["message"]' in body
+    assert '"snippet_fields":["message"]' in body
+    assert '"sort_by":["-timestamp"]' in body
+    assert '"aggs":{"levels":{"terms":{"field":"level"}}}' in body
     await client.aclose()
 
 

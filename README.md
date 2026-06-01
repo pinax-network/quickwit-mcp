@@ -17,14 +17,14 @@ Equivalent CLI flag:
 python -m src.server --quickwit-base-url "http://quickwit.example.vpn:7280"
 ```
 
-The MCP server listens on `0.0.0.0:8080` by default.
+The MCP server listens on `127.0.0.1:8080` by default. Set `MCP_HOST=0.0.0.0` only when exposing it on a trusted network such as a VPN.
 
 ## Configuration
 
 Environment variables:
 
 - `QUICKWIT_BASE_URL`: Quickwit REST base URL. Default: `http://localhost:7280`.
-- `MCP_HOST`: MCP bind host. Default: `0.0.0.0`.
+- `MCP_HOST`: MCP bind host. Default: `127.0.0.1`.
 - `MCP_PORT`: MCP bind port. Default: `8080`.
 - `MCP_ENDPOINT_PATH`: MCP endpoint path. Default: `/`.
 - `MCP_USER_AGENT`: User-Agent used for Quickwit requests.
@@ -44,7 +44,16 @@ python -m src.server \
 
 ## Tools
 
-The server exposes only curated readonly tools: `search`, `describe_index`, `list_splits`, `list_indexes`, `get_delete_tasks`, and `version`.
+The server exposes only curated readonly tools: `search`, `describe_index`, `list_splits`, `list_indexes`, and `version`.
+
+`list_indexes` returns both a stable summary and the raw Quickwit metadata for each index. Raw metadata is included because Quickwit metadata shapes vary across versions.
+
+`search` accepts one exact index ID. Quickwit multi-target expressions such as `logs-*` and `a,b` are intentionally not exposed.
+
+## Health endpoints
+
+- `/health`: liveness check for the MCP process.
+- `/ready`: readiness check that verifies Quickwit is reachable.
 
 ## Client proxy
 

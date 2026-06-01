@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import sys
-import time
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
@@ -18,8 +17,6 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.dependencies import get_http_request
-from fastmcp.server.middleware import Middleware, MiddlewareContext
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -37,7 +34,6 @@ MAX_SPLITS_LIMIT = 100
 
 @dataclass(frozen=True)
 class Settings:
-    active_session_ttl: int
     mcp_endpoint_path: str
     mcp_host: str
     mcp_port: int
@@ -52,7 +48,7 @@ class Settings:
 def build_settings(argv: list[str] | None = None) -> Settings:
     parser = argparse.ArgumentParser(description="Run Quickwit MCP server")
     parser.add_argument("--quickwit-base-url", default=os.getenv("QUICKWIT_BASE_URL", DEFAULT_QUICKWIT_BASE_URL))
-    parser.add_argument("--host", default=os.getenv("MCP_HOST", "0.0.0.0"))
+    parser.add_argument("--host", default=os.getenv("MCP_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("MCP_PORT", "8080")))
     parser.add_argument("--endpoint-path", default=os.getenv("MCP_ENDPOINT_PATH", "/"))
     args = parser.parse_args(argv)
@@ -60,7 +56,6 @@ def build_settings(argv: list[str] | None = None) -> Settings:
     quickwit_base_url = args.quickwit_base_url.rstrip("/")
 
     return Settings(
-        active_session_ttl=int(os.getenv("ACTIVE_SESSION_TTL", "600")),
         mcp_endpoint_path=args.endpoint_path,
         mcp_host=args.host,
         mcp_port=args.port,
@@ -83,36 +78,6 @@ logger = logging.getLogger(__name__)
 MCP_VERSION = __version__
 MCP_INSTANCE: FastMCP | None = None
 HTTP_CLIENT: httpx.AsyncClient | None = None
-ACTIVE_SESSIONS: dict[str, float] = {}
-
-
-class SessionTrackingMiddleware(Middleware):
-    def __init__(self, settings: Settings):
-        self.settings = settings
-
-    async def on_message(self, context: MiddlewareContext, call_next):
-        try:
-            request = get_http_request()
-            headers = request.headers.mutablecopy()
-            original_user_agent = headers.get("user-agent", "")
-            headers.update({"user-agent": f"{self.settings.mcp_user_agent} {original_user_agent}".strip()})
-            request._headers = headers
-        except Exception as exc:
-            logger.debug("Could not update User-Agent for client request: %s", exc)
-
-        return await call_next(context)
-
-    async def on_request(self, context: MiddlewareContext, call_next):
-        if context.fastmcp_context:
-            try:
-                session_id = context.fastmcp_context.session_id
-                _prune_expired_sessions(self.settings.active_session_ttl)
-                ACTIVE_SESSIONS[session_id] = time.monotonic()
-                logger.debug("Tracking session (total: %s)", len(ACTIVE_SESSIONS))
-            except Exception as exc:
-                logger.debug("Exception while tracking session: %s", exc)
-
-        return await call_next(context)
 
 
 async def quickwit_request(
@@ -158,6 +123,14 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
         async def _(_: Request) -> PlainTextResponse:
             return PlainTextResponse("OK")
 
+        @mcp.custom_route("/ready", methods=["GET"])
+        async def _(_: Request) -> PlainTextResponse:
+            try:
+                await quickwit_request(client, "GET", "/api/v1/version")
+            except ToolError as exc:
+                return PlainTextResponse(f"Quickwit unavailable: {exc}", status_code=503)
+            return PlainTextResponse("OK")
+
         @mcp.tool
         async def version() -> dict[str, Any]:
             """Return Quickwit node version and runtime information."""
@@ -165,7 +138,7 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
 
         @mcp.tool
         async def list_indexes() -> dict[str, list[dict[str, Any]]]:
-            """List Quickwit indexes with simplified metadata."""
+            """List Quickwit indexes with summary and raw metadata."""
             metadata = await quickwit_request(client, "GET", "/api/v1/indexes")
             if not isinstance(metadata, list):
                 raise ToolError("Quickwit returned unexpected index metadata")
@@ -187,18 +160,27 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             end_timestamp: int | None = None,
             search_field: list[str] | None = None,
             snippet_fields: list[str] | None = None,
-            sort_by: dict[str, Any] | None = None,
+            sort_by: list[str] | None = None,
             aggs: dict[str, Any] | None = None,
             count_all: bool = False,
             allow_failed_splits: bool = False,
         ) -> dict[str, Any]:
             """Search a Quickwit index. max_hits is capped at 100."""
             _validate_index_id(index_id)
+            if not isinstance(query, str):
+                raise ToolError("query must be a string")
             query = query.strip()
             if not query:
                 raise ToolError("query must not be empty")
             max_hits = _clamp_int(max_hits, minimum=0, maximum=MAX_SEARCH_HITS, name="max_hits")
             start_offset = _clamp_int(start_offset, minimum=0, maximum=1_000_000, name="start_offset")
+            search_field = _validate_string_list(search_field, "search_field")
+            snippet_fields = _validate_string_list(snippet_fields, "snippet_fields")
+            sort_by = _validate_string_list(sort_by, "sort_by")
+            start_timestamp = _validate_optional_int(start_timestamp, "start_timestamp")
+            end_timestamp = _validate_optional_int(end_timestamp, "end_timestamp")
+            if aggs is not None and not isinstance(aggs, dict):
+                raise ToolError("aggs must be an object")
             body = _strip_none({
                 "query": query,
                 "max_hits": max_hits,
@@ -228,6 +210,10 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             _validate_index_id(index_id)
             offset = _clamp_int(offset, minimum=0, maximum=1_000_000, name="offset")
             limit = _clamp_int(limit, minimum=0, maximum=MAX_SPLITS_LIMIT, name="limit")
+            split_states = _validate_string_list(split_states, "split_states")
+            start_timestamp = _validate_optional_int(start_timestamp, "start_timestamp")
+            end_timestamp = _validate_optional_int(end_timestamp, "end_timestamp")
+            end_create_timestamp = _validate_optional_int(end_create_timestamp, "end_create_timestamp")
             params = {
                 "offset": offset,
                 "limit": limit,
@@ -238,17 +224,7 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             }
             return await quickwit_request(client, "GET", f"/api/v1/indexes/{index_id}/splits", params=params)
 
-        @mcp.tool
-        async def get_delete_tasks(index_id: str) -> dict[str, list[dict[str, Any]]]:
-            """List delete tasks for a Quickwit index."""
-            _validate_index_id(index_id)
-            result = await quickwit_request(client, "GET", f"/api/v1/{index_id}/delete-tasks")
-            if not isinstance(result, list):
-                raise ToolError("Quickwit returned unexpected delete tasks")
-            return {"delete_tasks": result}
-
         _add_optional_middleware(mcp, settings)
-        mcp.add_middleware(SessionTrackingMiddleware(settings))
         return mcp
     except Exception as exc:
         logger.error("Failed to create MCP server: %s", exc)
@@ -273,6 +249,7 @@ async def main(argv: list[str] | None = None):
         headers={"user-agent": settings.mcp_user_agent},
     )
     logger.info("Created persistent HTTP client with User-Agent: %s", settings.mcp_user_agent)
+    await _log_quickwit_compatibility(HTTP_CLIENT)
 
     MCP_INSTANCE = create_mcp(HTTP_CLIENT, settings)
     if not MCP_INSTANCE:
@@ -294,11 +271,19 @@ async def main(argv: list[str] | None = None):
             logger.info("HTTP client closed")
 
 
-def _prune_expired_sessions(ttl_seconds: int) -> None:
-    now = time.monotonic()
-    for session_id, last_seen in list(ACTIVE_SESSIONS.items()):
-        if now - last_seen > ttl_seconds:
-            ACTIVE_SESSIONS.pop(session_id, None)
+async def _log_quickwit_compatibility(client: httpx.AsyncClient) -> None:
+    try:
+        version_info = await quickwit_request(client, "GET", "/api/v1/version")
+    except ToolError as exc:
+        logger.warning("Quickwit compatibility check failed: %s", exc)
+        return
+
+    quickwit_version = None
+    if isinstance(version_info, dict):
+        build = version_info.get("build")
+        if isinstance(build, dict):
+            quickwit_version = build.get("version") or build.get("cargo_pkg_version")
+    logger.info("Quickwit version: %s", quickwit_version or "unknown")
 
 
 def _add_optional_middleware(mcp: FastMCP, settings: Settings) -> None:
@@ -361,26 +346,83 @@ def _extract_error_message(response: httpx.Response) -> str:
 
 
 def _clamp_int(value: int, *, minimum: int, maximum: int, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ToolError(f"{name} must be an integer")
     if value < minimum:
         raise ToolError(f"{name} must be >= {minimum}")
     return min(value, maximum)
 
 
+def _validate_optional_int(value: int | None, name: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ToolError(f"{name} must be an integer")
+    return value
+
+
+def _validate_string_list(value: list[str] | None, name: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ToolError(f"{name} must be a list of strings")
+    cleaned = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ToolError(f"{name} must be a list of strings")
+        item = item.strip()
+        if not item:
+            raise ToolError(f"{name} must not contain empty strings")
+        cleaned.append(item)
+    return cleaned
+
+
 def _validate_index_id(index_id: str) -> None:
+    if not isinstance(index_id, str):
+        raise ToolError("index_id is invalid")
     if not INDEX_ID_PATTERN.fullmatch(index_id):
         raise ToolError("index_id is invalid")
 
 
 def _simplify_index_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    doc_mapping = metadata.get("doc_mapping") if isinstance(metadata.get("doc_mapping"), dict) else {}
-    search_settings = metadata.get("search_settings") if isinstance(metadata.get("search_settings"), dict) else {}
+    index_config = metadata.get("index_config") if isinstance(metadata.get("index_config"), dict) else metadata
+    doc_mapping = index_config.get("doc_mapping") if isinstance(index_config.get("doc_mapping"), dict) else {}
+    search_settings = index_config.get("search_settings") if isinstance(index_config.get("search_settings"), dict) else {}
     return {
-        "index_id": metadata.get("index_id"),
-        "index_uri": metadata.get("index_uri"),
-        "version": metadata.get("version"),
-        "timestamp_field": doc_mapping.get("timestamp_field"),
-        "default_search_fields": search_settings.get("default_search_fields", []),
+        "summary": {
+            "index_id": _extract_index_id(metadata, index_config),
+            "index_uri": _first_string(index_config.get("index_uri"), metadata.get("index_uri")),
+            "version": _first_string(index_config.get("version"), metadata.get("version")),
+            "timestamp_field": _first_string(doc_mapping.get("timestamp_field"), metadata.get("timestamp_field")),
+            "default_search_fields": _extract_default_search_fields(search_settings),
+        },
+        "raw_metadata": metadata,
     }
+
+
+def _extract_index_id(metadata: dict[str, Any], index_config: dict[str, Any]) -> str | None:
+    direct_value = _first_string(index_config.get("index_id"), metadata.get("index_id"))
+    if direct_value:
+        return direct_value
+
+    index_uid = _first_string(index_config.get("index_uid"), metadata.get("index_uid"))
+    if index_uid:
+        return index_uid.split(":", maxsplit=1)[0]
+    return None
+
+
+def _extract_default_search_fields(search_settings: dict[str, Any]) -> list[str]:
+    value = search_settings.get("default_search_fields", [])
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
+def _first_string(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 if __name__ == "__main__":
