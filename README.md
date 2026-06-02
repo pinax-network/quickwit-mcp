@@ -28,6 +28,8 @@ Environment variables:
 - `MCP_PORT`: MCP bind port. Default: `8080`.
 - `MCP_ENDPOINT_PATH`: MCP endpoint path. Default: `/`.
 - `MCP_USER_AGENT`: User-Agent used for Quickwit requests.
+- `MCP_DEFAULT_TIMEZONE`: Timezone used for naive RFC3339 inputs. Default: `UTC`.
+- `MCP_MAX_SEARCH_WINDOW_SECONDS`: Maximum time range for log search tools. Default: `86400`.
 - `MCP_RATE_LIMIT_RPS`: MCP request rate limit. Default: `5.0`.
 - `MCP_RATE_LIMIT_BURST`: MCP request burst capacity. Default: `20`.
 - `MCP_RESPONSE_LIMIT_BYTES`: Maximum MCP response size. Default: `500000`.
@@ -44,11 +46,27 @@ python -m src.server \
 
 ## Tools
 
-The server exposes only curated readonly tools: `search`, `describe_index`, `list_splits`, `list_indexes`, and `version`.
+The server exposes only curated readonly tools: `search_logs`, `inspect_index`, `search`, `describe_index`, `list_splits`, `list_indexes`, and `version`.
 
 `list_indexes` returns both a stable summary and the raw Quickwit metadata for each index. Raw metadata is included because Quickwit metadata shapes vary across versions.
 
-`search` accepts one exact index ID. Quickwit multi-target expressions such as `logs-*` and `a,b` are intentionally not exposed.
+Search tools accept one exact index ID. Quickwit multi-target expressions such as `logs-*` and `a,b` are intentionally not exposed.
+
+Prefer `search_logs` for bounded operational log search. It accepts RFC3339 `start_time` and `end_time`, sorts by the Quickwit `timestamp_field` by default when present, and returns compact truncated hits.
+
+Use `inspect_index` before searches to see Quickwit-native metadata: field names, `timestamp_field`, `default_search_fields`, and raw index metadata. The MCP server does not infer application-specific field meanings.
+
+Example log search arguments:
+
+```json
+{
+  "index_id": "sample-index",
+  "text": "storage-api",
+  "start_time": "2026-05-31T14:00:00Z",
+  "end_time": "2026-05-31T15:00:00Z",
+  "max_hits": 20
+}
+```
 
 ## Health endpoints
 

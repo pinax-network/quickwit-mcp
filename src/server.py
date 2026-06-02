@@ -10,9 +10,11 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastmcp import FastMCP
@@ -28,14 +30,17 @@ except PackageNotFoundError:
 
 DEFAULT_QUICKWIT_BASE_URL = "http://localhost:7280"
 INDEX_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+FIELD_NAME_PATTERN = re.compile(r"^[A-Za-z_@][A-Za-z0-9_.@-]{0,254}$")
 MAX_SEARCH_HITS = 100
 MAX_SPLITS_LIMIT = 100
-
+MAX_TRUNCATE_FIELD_BYTES = 10_000
 
 @dataclass(frozen=True)
 class Settings:
+    mcp_default_timezone: str
     mcp_endpoint_path: str
     mcp_host: str
+    mcp_max_search_window_seconds: int
     mcp_port: int
     mcp_rate_limit_burst: int
     mcp_rate_limit_rps: float
@@ -56,8 +61,10 @@ def build_settings(argv: list[str] | None = None) -> Settings:
     quickwit_base_url = args.quickwit_base_url.rstrip("/")
 
     return Settings(
+        mcp_default_timezone=_validate_timezone_name(os.getenv("MCP_DEFAULT_TIMEZONE", "UTC")),
         mcp_endpoint_path=args.endpoint_path,
         mcp_host=args.host,
+        mcp_max_search_window_seconds=int(os.getenv("MCP_MAX_SEARCH_WINDOW_SECONDS", "86400")),
         mcp_port=args.port,
         mcp_rate_limit_burst=int(os.getenv("MCP_RATE_LIMIT_BURST", "20")),
         mcp_rate_limit_rps=float(os.getenv("MCP_RATE_LIMIT_RPS", "5.0")),
@@ -151,6 +158,47 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             return await quickwit_request(client, "GET", f"/api/v1/indexes/{index_id}/describe")
 
         @mcp.tool
+        async def inspect_index(index_id: str) -> dict[str, Any]:
+            """Inspect one Quickwit index and return Quickwit-native metadata."""
+            metadata = await _get_index_metadata(client, index_id)
+            return _inspect_index_metadata(metadata)
+
+        @mcp.tool
+        async def search_logs(
+            index_id: str,
+            start_time: str,
+            end_time: str,
+            text: str = "*",
+            fields: list[str] | None = None,
+            sort_field: str | None = None,
+            sort_order: str = "desc",
+            max_hits: int = 20,
+            truncate_field_bytes: int = 2000,
+            include_raw: bool = False,
+        ) -> dict[str, Any]:
+            """Preferred log search: use RFC3339 time bounds and return compact operational log results."""
+            metadata = await _get_index_metadata(client, index_id)
+            inspection = _inspect_index_metadata(metadata)
+            start_timestamp, end_timestamp, warnings = _parse_time_window(start_time, end_time, settings)
+            timestamp_field = sort_field or _metadata_field_name(inspection, "timestamp_field")
+            body = _build_log_search_body(
+                query=_clean_query(text),
+                start_timestamp=start_timestamp,
+                end_timestamp=end_timestamp,
+                max_hits=max_hits,
+                sort_field=timestamp_field,
+                sort_order=sort_order,
+            )
+            result = await quickwit_request(client, "POST", f"/api/v1/{index_id}/search", json_body=body)
+            return _compact_search_response(
+                result,
+                fields=fields,
+                truncate_field_bytes=truncate_field_bytes,
+                include_raw=include_raw,
+                warnings=warnings,
+            )
+
+        @mcp.tool
         async def search(
             index_id: str,
             query: str,
@@ -160,12 +208,13 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             end_timestamp: int | None = None,
             search_field: list[str] | None = None,
             snippet_fields: list[str] | None = None,
-            sort_by: list[str] | None = None,
+            sort_field: str | None = None,
+            sort_order: str = "desc",
             aggs: dict[str, Any] | None = None,
             count_all: bool = False,
             allow_failed_splits: bool = False,
         ) -> dict[str, Any]:
-            """Search a Quickwit index. max_hits is capped at 100."""
+            """Low-level Quickwit search for advanced use. Prefer search_logs for operational logs."""
             _validate_index_id(index_id)
             if not isinstance(query, str):
                 raise ToolError("query must be a string")
@@ -176,7 +225,7 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             start_offset = _clamp_int(start_offset, minimum=0, maximum=1_000_000, name="start_offset")
             search_field = _validate_string_list(search_field, "search_field")
             snippet_fields = _validate_string_list(snippet_fields, "snippet_fields")
-            sort_by = _validate_string_list(sort_by, "sort_by")
+            sort_by = _build_sort_by(sort_field, sort_order)
             start_timestamp = _validate_optional_int(start_timestamp, "start_timestamp")
             end_timestamp = _validate_optional_int(end_timestamp, "end_timestamp")
             if aggs is not None and not isinstance(aggs, dict):
@@ -286,6 +335,149 @@ async def _log_quickwit_compatibility(client: httpx.AsyncClient) -> None:
     logger.info("Quickwit version: %s", quickwit_version or "unknown")
 
 
+async def _get_index_metadata(client: httpx.AsyncClient, index_id: str) -> dict[str, Any]:
+    _validate_index_id(index_id)
+    metadata = await quickwit_request(client, "GET", f"/api/v1/indexes/{index_id}")
+    if not isinstance(metadata, dict):
+        raise ToolError("Quickwit returned unexpected index metadata")
+    return metadata
+
+
+def _inspect_index_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    summary = _simplify_index_metadata(metadata)["summary"]
+    field_names = _extract_field_names(metadata)
+    return {
+        "index_id": summary["index_id"],
+        "index_uri": summary["index_uri"],
+        "version": summary["version"],
+        "timestamp_field": summary["timestamp_field"],
+        "default_search_fields": summary["default_search_fields"],
+        "field_names": sorted(field_names),
+        "raw_metadata": metadata,
+    }
+
+
+def _parse_time_window(start_time: str, end_time: str, settings: Settings) -> tuple[int, int, list[str]]:
+    default_timezone = ZoneInfo(settings.mcp_default_timezone)
+    start_timestamp, start_warnings = _parse_time(start_time, default_timezone, "start_time")
+    end_timestamp, end_warnings = _parse_time(end_time, default_timezone, "end_time")
+    if start_timestamp >= end_timestamp:
+        raise ToolError("start_time must be before end_time")
+    window_seconds = end_timestamp - start_timestamp
+    if window_seconds > settings.mcp_max_search_window_seconds:
+        raise ToolError(f"time window must be <= {settings.mcp_max_search_window_seconds} seconds")
+    return start_timestamp, end_timestamp, [*start_warnings, *end_warnings]
+
+
+def _parse_time(value: str, default_timezone: ZoneInfo, name: str) -> tuple[int, list[str]]:
+    if not isinstance(value, str) or not value.strip():
+        raise ToolError(f"{name} must be an RFC3339 datetime string")
+    raw_value = value.strip()
+    normalized = raw_value[:-1] + "+00:00" if raw_value.endswith("Z") else raw_value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ToolError(f"{name} must be an RFC3339 datetime string") from exc
+
+    warnings = []
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=default_timezone)
+        warnings.append(f"{name} had no timezone; interpreted as {default_timezone.key}")
+    return int(parsed.timestamp()), warnings
+
+
+def _build_log_search_body(
+    *,
+    query: str,
+    start_timestamp: int,
+    end_timestamp: int,
+    max_hits: int,
+    sort_field: str | None,
+    sort_order: str,
+) -> dict[str, Any]:
+    max_hits = _clamp_int(max_hits, minimum=1, maximum=MAX_SEARCH_HITS, name="max_hits")
+    return _strip_none({
+        "query": query,
+        "start_timestamp": start_timestamp,
+        "end_timestamp": end_timestamp,
+        "max_hits": max_hits,
+        "sort_by": _build_sort_by(sort_field, sort_order),
+    }) or {}
+
+
+def _build_sort_by(sort_field: str | None, sort_order: str) -> list[str] | None:
+    if sort_field is None:
+        return None
+    _validate_field_name(sort_field, "sort_field")
+    if sort_order not in {"asc", "desc"}:
+        raise ToolError("sort_order must be 'asc' or 'desc'")
+    return [sort_field if sort_order == "asc" else f"-{sort_field}"]
+
+
+def _compact_search_response(
+    result: Any,
+    *,
+    fields: list[str] | None,
+    truncate_field_bytes: int,
+    include_raw: bool,
+    warnings: list[str],
+) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise ToolError("Quickwit returned unexpected search response")
+    hits = result.get("hits")
+    if not isinstance(hits, list):
+        raise ToolError("Quickwit returned unexpected search hits")
+    selected_fields = _validate_field_list(fields, "fields") or []
+    truncate_field_bytes = _clamp_int(
+        truncate_field_bytes,
+        minimum=0,
+        maximum=MAX_TRUNCATE_FIELD_BYTES,
+        name="truncate_field_bytes",
+    )
+
+    compact_hits = []
+    truncated = False
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        compact_hit, hit_truncated = _compact_hit(hit, selected_fields, truncate_field_bytes)
+        compact_hits.append(compact_hit)
+        truncated = truncated or hit_truncated
+
+    response = {
+        "num_hits": result.get("num_hits"),
+        "returned_hits": len(compact_hits),
+        "elapsed_time_micros": result.get("elapsed_time_micros"),
+        "hits": compact_hits,
+        "truncated": truncated,
+        "warnings": warnings,
+    }
+    if include_raw:
+        response["raw_response"] = result
+    return response
+
+
+def _compact_hit(hit: dict[str, Any], fields: list[str], truncate_field_bytes: int) -> tuple[dict[str, Any], bool]:
+    compact_hit = {}
+    truncated = False
+    for field in fields:
+        value = _get_nested_value(hit, field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value, was_truncated = _truncate_string(value, truncate_field_bytes)
+            truncated = truncated or was_truncated
+        compact_hit[field] = value
+    if compact_hit:
+        return compact_hit, truncated
+    fallback = dict(hit)
+    for key, value in list(fallback.items()):
+        if isinstance(value, str):
+            fallback[key], was_truncated = _truncate_string(value, truncate_field_bytes)
+            truncated = truncated or was_truncated
+    return fallback, truncated
+
+
 def _add_optional_middleware(mcp: FastMCP, settings: Settings) -> None:
     middleware_specs = (
         (
@@ -326,6 +518,14 @@ def _load_class(module_name: str, class_name: str) -> type | None:
     except ImportError:
         return None
     return getattr(module, class_name, None)
+
+
+def _validate_timezone_name(value: str) -> str:
+    try:
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"invalid MCP_DEFAULT_TIMEZONE: {value}") from exc
+    return value
 
 
 def _strip_none(value: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -377,11 +577,34 @@ def _validate_string_list(value: list[str] | None, name: str) -> list[str] | Non
     return cleaned
 
 
+def _validate_field_list(value: list[str] | None, name: str) -> list[str] | None:
+    cleaned = _validate_string_list(value, name)
+    if cleaned is None:
+        return None
+    for item in cleaned:
+        _validate_field_name(item, name)
+    return cleaned
+
+
+def _validate_field_name(value: str, name: str) -> None:
+    if not isinstance(value, str) or not FIELD_NAME_PATTERN.fullmatch(value):
+        raise ToolError(f"{name} is invalid")
+
+
 def _validate_index_id(index_id: str) -> None:
     if not isinstance(index_id, str):
         raise ToolError("index_id is invalid")
     if not INDEX_ID_PATTERN.fullmatch(index_id):
         raise ToolError("index_id is invalid")
+
+
+def _clean_query(value: str | None) -> str:
+    if value is None:
+        return "*"
+    if not isinstance(value, str):
+        raise ToolError("text must be a string")
+    value = value.strip()
+    return value or "*"
 
 
 def _simplify_index_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -398,6 +621,70 @@ def _simplify_index_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         },
         "raw_metadata": metadata,
     }
+
+
+def _extract_field_names(metadata: dict[str, Any]) -> set[str]:
+    index_config = metadata.get("index_config") if isinstance(metadata.get("index_config"), dict) else metadata
+    doc_mapping = index_config.get("doc_mapping") if isinstance(index_config.get("doc_mapping"), dict) else {}
+    field_mappings = doc_mapping.get("field_mappings")
+    field_names: set[str] = set()
+    if isinstance(field_mappings, list):
+        for item in field_mappings:
+            _collect_field_names(item, field_names)
+    timestamp_field = doc_mapping.get("timestamp_field")
+    if isinstance(timestamp_field, str):
+        field_names.add(timestamp_field)
+    search_settings = index_config.get("search_settings") if isinstance(index_config.get("search_settings"), dict) else {}
+    for field in _extract_default_search_fields(search_settings):
+        field_names.add(field)
+    return field_names
+
+
+def _collect_field_names(mapping: Any, field_names: set[str], prefix: str = "") -> None:
+    if not isinstance(mapping, dict):
+        return
+    name = mapping.get("name")
+    current_prefix = prefix
+    if isinstance(name, str) and name:
+        full_name = f"{prefix}.{name}" if prefix else name
+        field_names.add(full_name)
+        current_prefix = full_name
+    nested = mapping.get("field_mappings") or mapping.get("fields")
+    if isinstance(nested, list):
+        for item in nested:
+            _collect_field_names(item, field_names, current_prefix)
+
+
+def _metadata_field_name(inspection: dict[str, Any], name: str) -> str | None:
+    value = inspection.get(name)
+    return value if isinstance(value, str) else None
+
+
+def _get_nested_value(data: dict[str, Any], field: str) -> Any:
+    if field in data:
+        return data[field]
+    for wrapper in ("_source", "doc"):
+        wrapped = data.get(wrapper)
+        if isinstance(wrapped, dict):
+            wrapped_value = _get_nested_value(wrapped, field)
+            if wrapped_value is not None:
+                return wrapped_value
+    current: Any = data
+    for part in field.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _truncate_string(value: str, max_bytes: int) -> tuple[str, bool]:
+    if max_bytes == 0:
+        return "", bool(value)
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value, False
+    truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return f"{truncated}…", True
 
 
 def _extract_index_id(metadata: dict[str, Any], index_config: dict[str, Any]) -> str | None:
