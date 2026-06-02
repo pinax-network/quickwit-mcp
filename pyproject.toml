@@ -1,6 +1,6 @@
 [project]
 name = "quickwit-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "REST-based MCP server for Quickwit"
 requires-python = ">=3.11"
 dependencies = [
