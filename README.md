@@ -46,15 +46,24 @@ python -m src.server \
 
 ## Tools
 
-The server exposes only curated readonly tools: `search_logs`, `inspect_index`, `search`, `describe_index`, `list_splits`, `list_indexes`, and `version`.
+The server exposes only curated readonly tools: `search_logs`, `search`, `inspect_index`, `list_fields`, `describe_index`, `list_splits`, `list_indexes`, and `version`.
 
 `list_indexes` returns both a stable summary and the raw Quickwit metadata for each index. Raw metadata is included because Quickwit metadata shapes vary across versions.
 
 Search tools accept one exact index ID. Quickwit multi-target expressions such as `logs-*` and `a,b` are intentionally not exposed.
 
-Prefer `search_logs` for bounded operational log search. It accepts RFC3339 `start_time` and `end_time`, sorts by the Quickwit `timestamp_field` by default when present, and returns compact truncated hits. You can pass `subject` with `subject_kind: "service"` to let the MCP server pick service-like fields from index metadata before building the Quickwit query; responses include `query_plan` when this path is used.
+Prefer `search_logs` for bounded operational log search. It accepts RFC3339 `start_time` and `end_time`, sorts by the Quickwit `timestamp_field` by default when present, and returns compact truncated hits. You can pass `subject` with `subject_kind: "service"` to let the MCP server pick service-like fields from static index metadata before building the Quickwit query; responses include `query_plan` when this path is used.
 
-Use `inspect_index` before searches to see Quickwit-native metadata: field names, `timestamp_field`, `default_search_fields`, and raw index metadata. The MCP server does not infer application-specific field meanings.
+Use `inspect_index` before searches to see Quickwit-native metadata: `timestamp_field`, `default_search_fields`, static field names, whether dynamic mapping is enabled, and raw index metadata. If `dynamic_mapping` is true or you need searchable/aggregatable field capabilities, call `list_fields` next.
+
+Use `list_fields` to discover fields Quickwit has seen in indexed documents via the Elasticsearch-compatible `_field_caps` API. On large indexes, pass `start_timestamp` and `end_timestamp` in epoch seconds and optional `field_patterns` such as `["message", "resource_attributes.*"]` to keep discovery bounded.
+
+Recommended agent workflow:
+
+1. Call `list_indexes` to choose one exact index ID.
+2. Call `inspect_index` to get static metadata and time/default fields.
+3. Call `list_fields` when dynamic fields or field capabilities are needed.
+4. Build a Quickwit query and call `search_logs` for RFC3339-bounded log searches, or `search` for lower-level Quickwit searches and aggregations.
 
 Example log search arguments:
 

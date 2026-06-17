@@ -31,6 +31,7 @@ except PackageNotFoundError:
 DEFAULT_QUICKWIT_BASE_URL = "http://localhost:7280"
 INDEX_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
 FIELD_NAME_PATTERN = re.compile(r"^[A-Za-z_@][A-Za-z0-9_.@-]{0,254}$")
+FIELD_PATTERN_PATTERN = re.compile(r"^[A-Za-z0-9_@.*-]{1,255}$")
 MAX_SEARCH_HITS = 100
 MAX_SPLITS_LIMIT = 100
 MAX_TRUNCATE_FIELD_BYTES = 10_000
@@ -159,9 +160,38 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
 
         @mcp.tool
         async def inspect_index(index_id: str) -> dict[str, Any]:
-            """Inspect one Quickwit index and return Quickwit-native metadata."""
+            """Inspect one exact Quickwit index before searching.
+
+            Use this first to identify the timestamp field, default search fields, and static index mapping.
+            For dynamic fields discovered from indexed documents, call list_fields with a bounded time range.
+            """
             metadata = await _get_index_metadata(client, index_id)
             return _inspect_index_metadata(metadata)
+
+        @mcp.tool
+        async def list_fields(
+            index_id: str,
+            field_patterns: list[str] | None = None,
+            start_timestamp: int | None = None,
+            end_timestamp: int | None = None,
+        ) -> dict[str, Any]:
+            """List searchable/aggregatable fields discovered by Quickwit for one index.
+
+            Use after inspect_index when an index uses dynamic mapping or when the query needs fields that are
+            present in documents but not listed in static metadata. Provide start_timestamp/end_timestamp in epoch
+            seconds to limit discovery cost on large indexes. field_patterns accepts Quickwit field globs such as
+            ["message", "resource_attributes.*"].
+            """
+            _validate_index_id(index_id)
+            field_patterns = _validate_field_patterns(field_patterns)
+            start_timestamp = _validate_optional_int(start_timestamp, "start_timestamp")
+            end_timestamp = _validate_optional_int(end_timestamp, "end_timestamp")
+            params = _strip_none({
+                "fields": _join_simple_list(field_patterns),
+                "start_timestamp": start_timestamp,
+                "end_timestamp": end_timestamp,
+            })
+            return await quickwit_request(client, "GET", f"/api/v1/_elastic/{index_id}/_field_caps", params=params)
 
         @mcp.tool
         async def search_logs(
@@ -247,8 +277,8 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
                 "start_offset": start_offset,
                 "start_timestamp": start_timestamp,
                 "end_timestamp": end_timestamp,
-                "search_field": search_field,
-                "snippet_fields": snippet_fields,
+                "search_field": _join_simple_list(search_field),
+                "snippet_fields": _join_simple_list(snippet_fields),
                 "sort_by": sort_by,
                 "aggs": aggs,
                 "count_all": count_all,
@@ -357,6 +387,7 @@ async def _get_index_metadata(client: httpx.AsyncClient, index_id: str) -> dict[
 def _inspect_index_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     summary = _simplify_index_metadata(metadata)["summary"]
     field_names = _extract_field_names(metadata)
+    dynamic_mapping = _has_dynamic_mapping(metadata)
     return {
         "index_id": summary["index_id"],
         "index_uri": summary["index_uri"],
@@ -364,6 +395,13 @@ def _inspect_index_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "timestamp_field": summary["timestamp_field"],
         "default_search_fields": summary["default_search_fields"],
         "field_names": sorted(field_names),
+        "dynamic_mapping": dynamic_mapping,
+        "field_discovery_hint": (
+            "This index has dynamic mapping; field_names only contains static metadata fields. "
+            "Call list_fields with a bounded time range to discover fields present in indexed documents."
+            if dynamic_mapping
+            else "field_names comes from static index metadata. Call list_fields if you need searchable/aggregatable capabilities."
+        ),
         "raw_metadata": metadata,
     }
 
@@ -515,13 +553,19 @@ def _combine_queries(base_query: str, subject_clause: str) -> str:
     return f"({base_query}) AND {subject_clause}"
 
 
-def _build_sort_by(sort_field: str | None, sort_order: str) -> list[str] | None:
+def _build_sort_by(sort_field: str | None, sort_order: str) -> str | None:
     if sort_field is None:
         return None
     _validate_field_name(sort_field, "sort_field")
     if sort_order not in {"asc", "desc"}:
         raise ToolError("sort_order must be 'asc' or 'desc'")
-    return [sort_field if sort_order == "asc" else f"-{sort_field}"]
+    return f"-{sort_field}" if sort_order == "asc" else sort_field
+
+
+def _join_simple_list(values: list[str] | None) -> str | None:
+    if not values:
+        return None
+    return ",".join(values)
 
 
 def _compact_search_response(
@@ -699,6 +743,16 @@ def _validate_field_list(value: list[str] | None, name: str) -> list[str] | None
     return cleaned
 
 
+def _validate_field_patterns(value: list[str] | None) -> list[str] | None:
+    cleaned = _validate_string_list(value, "field_patterns")
+    if cleaned is None:
+        return None
+    for item in cleaned:
+        if not FIELD_PATTERN_PATTERN.fullmatch(item):
+            raise ToolError("field_patterns contains an invalid pattern")
+    return cleaned
+
+
 def _validate_field_name(value: str, name: str) -> None:
     if not isinstance(value, str) or not FIELD_NAME_PATTERN.fullmatch(value):
         raise ToolError(f"{name} is invalid")
@@ -751,6 +805,12 @@ def _extract_field_names(metadata: dict[str, Any]) -> set[str]:
     for field in _extract_default_search_fields(search_settings):
         field_names.add(field)
     return field_names
+
+
+def _has_dynamic_mapping(metadata: dict[str, Any]) -> bool:
+    index_config = metadata.get("index_config") if isinstance(metadata.get("index_config"), dict) else metadata
+    doc_mapping = index_config.get("doc_mapping") if isinstance(index_config.get("doc_mapping"), dict) else {}
+    return isinstance(doc_mapping.get("dynamic_mapping"), dict)
 
 
 def _collect_field_names(mapping: Any, field_names: set[str], prefix: str = "") -> None:

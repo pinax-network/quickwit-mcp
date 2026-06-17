@@ -67,6 +67,21 @@ def quickwit_transport(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"build": {"version": "0.8.0-nightly"}})
     if request.url.path == "/api/v1/indexes/sample-index/describe":
         return httpx.Response(200, json={"index_id": "sample-index"})
+    if request.url.path == "/api/v1/_elastic/sample-index/_field_caps":
+        return httpx.Response(
+            200,
+            json={
+                "indices": ["sample-index"],
+                "fields": {
+                    "message": {
+                        "text": {"metadata_field": False, "searchable": True, "aggregatable": False, "type": "text"}
+                    },
+                    "status": {
+                        "keyword": {"metadata_field": False, "searchable": True, "aggregatable": True, "type": "keyword"}
+                    },
+                },
+            },
+        )
     if request.url.path == "/api/v1/sample-index/search":
         return httpx.Response(
             200,
@@ -104,6 +119,7 @@ async def test_create_mcp_exposes_only_curated_tools():
     assert tool_names == {
         "describe_index",
         "inspect_index",
+        "list_fields",
         "list_indexes",
         "list_splits",
         "search",
@@ -197,7 +213,42 @@ async def test_inspect_index_returns_quickwit_native_metadata():
         "status",
         "timestamp",
     ]
+    assert content["dynamic_mapping"] is False
+    assert "Call list_fields" in content["field_discovery_hint"]
     assert "candidate_log_fields" not in content
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_fields_uses_elastic_field_caps_with_optional_filters():
+    captured = {}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/_elastic/sample-index/_field_caps":
+            captured["url"] = str(request.url)
+        return quickwit_transport(request)
+
+    settings = build_settings([])
+    client = httpx.AsyncClient(base_url="http://quickwit.example", transport=httpx.MockTransport(transport))
+    mcp = create_mcp(client, settings)
+
+    assert mcp is not None
+    async with Client(transport=mcp) as mcp_client:
+        result = await mcp_client.call_tool(
+            "list_fields",
+            {
+                "index_id": "sample-index",
+                "field_patterns": ["mess*", "status"],
+                "start_timestamp": 1770000000,
+                "end_timestamp": 1770003600,
+            },
+        )
+
+    assert "/api/v1/_elastic/sample-index/_field_caps" in captured["url"]
+    assert "fields=mess%2A%2Cstatus" in captured["url"]
+    assert "start_timestamp=1770000000" in captured["url"]
+    assert "end_timestamp=1770003600" in captured["url"]
+    assert result.structured_content["fields"]["message"]["text"]["searchable"] is True
     await client.aclose()
 
 
@@ -228,7 +279,7 @@ async def test_search_logs_uses_rfc3339_time_and_compact_response():
 
     body = captured["body"].replace(" ", "")
     assert '"query":"storage-api"' in body
-    assert '"sort_by":["-timestamp"]' in body
+    assert '"sort_by":"timestamp"' in body
     assert result.structured_content["returned_hits"] == 1
     assert result.structured_content["hits"][0]["message"] == "service started"
     await client.aclose()
@@ -409,9 +460,9 @@ async def test_search_accepts_typed_advanced_params():
         )
 
     body = captured["body"].replace(" ", "")
-    assert '"search_field":["message"]' in body
-    assert '"snippet_fields":["message"]' in body
-    assert '"sort_by":["-timestamp"]' in body
+    assert '"search_field":"message"' in body
+    assert '"snippet_fields":"message"' in body
+    assert '"sort_by":"timestamp"' in body
     assert '"aggs":{"statuses":{"terms":{"field":"status"}}}' in body
     await client.aclose()
 
