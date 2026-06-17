@@ -235,6 +235,133 @@ async def test_search_logs_uses_rfc3339_time_and_compact_response():
 
 
 @pytest.mark.asyncio
+async def test_search_logs_auto_discovers_service_field():
+    captured = {}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/sample-index/search":
+            captured["body"] = request.read().decode()
+        return quickwit_transport(request)
+
+    settings = build_settings([])
+    client = httpx.AsyncClient(base_url="http://quickwit.example", transport=httpx.MockTransport(transport))
+    mcp = create_mcp(client, settings)
+
+    assert mcp is not None
+    async with Client(transport=mcp) as mcp_client:
+        result = await mcp_client.call_tool(
+            "search_logs",
+            {
+                "index_id": "sample-index",
+                "subject": "Firehose",
+                "subject_kind": "service",
+                "start_time": "2026-05-31T14:00:00Z",
+                "end_time": "2026-05-31T15:00:00Z",
+            },
+        )
+
+    body = captured["body"]
+    assert "service.name:Firehose" in body
+    assert result.structured_content["query_plan"]["selected_fields"] == ["service.name"]
+    assert result.structured_content["query_plan"]["subject_kind"] == "service"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_logs_combines_text_and_subject():
+    captured = {}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/sample-index/search":
+            captured["body"] = request.read().decode()
+        return quickwit_transport(request)
+
+    settings = build_settings([])
+    client = httpx.AsyncClient(base_url="http://quickwit.example", transport=httpx.MockTransport(transport))
+    mcp = create_mcp(client, settings)
+
+    assert mcp is not None
+    async with Client(transport=mcp) as mcp_client:
+        await mcp_client.call_tool(
+            "search_logs",
+            {
+                "index_id": "sample-index",
+                "text": "error",
+                "subject": "Firehose",
+                "subject_kind": "service",
+                "start_time": "2026-05-31T14:00:00Z",
+                "end_time": "2026-05-31T15:00:00Z",
+            },
+        )
+
+    assert '"query":"(error) AND (service.name:Firehose' in captured["body"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_logs_falls_back_to_free_text_when_no_service_field():
+    captured = {}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/indexes/sample-index":
+            metadata = quickwit_transport(request).json()
+            metadata["index_config"]["doc_mapping"]["field_mappings"] = [
+                {"name": "timestamp", "type": "datetime"},
+                {"name": "message", "type": "text"},
+            ]
+            return httpx.Response(200, json=metadata)
+        if request.url.path == "/api/v1/sample-index/search":
+            captured["body"] = request.read().decode()
+        return quickwit_transport(request)
+
+    settings = build_settings([])
+    client = httpx.AsyncClient(base_url="http://quickwit.example", transport=httpx.MockTransport(transport))
+    mcp = create_mcp(client, settings)
+
+    assert mcp is not None
+    async with Client(transport=mcp) as mcp_client:
+        result = await mcp_client.call_tool(
+            "search_logs",
+            {
+                "index_id": "sample-index",
+                "subject": "Firehose",
+                "subject_kind": "service",
+                "start_time": "2026-05-31T14:00:00Z",
+                "end_time": "2026-05-31T15:00:00Z",
+            },
+        )
+
+    assert '"query":"(Firehose OR firehose)"' in captured["body"]
+    assert result.structured_content["query_plan"]["selected_fields"] == []
+    assert result.structured_content["query_plan"]["warnings"] == [
+        "no service fields found; used free-text subject search"
+    ]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_logs_rejects_unknown_subject_kind():
+    settings = build_settings([])
+    client = httpx.AsyncClient(base_url="http://quickwit.example", transport=httpx.MockTransport(quickwit_transport))
+    mcp = create_mcp(client, settings)
+
+    assert mcp is not None
+    async with Client(transport=mcp) as mcp_client:
+        with pytest.raises(ToolError, match="subject_kind must be 'free_text' or 'service'"):
+            await mcp_client.call_tool(
+                "search_logs",
+                {
+                    "index_id": "sample-index",
+                    "subject": "Firehose",
+                    "subject_kind": "namespace",
+                    "start_time": "2026-05-31T14:00:00Z",
+                    "end_time": "2026-05-31T15:00:00Z",
+                },
+            )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_search_caps_max_hits():
     captured = {}
 

@@ -52,7 +52,7 @@ The server exposes only curated readonly tools: `search_logs`, `inspect_index`, 
 
 Search tools accept one exact index ID. Quickwit multi-target expressions such as `logs-*` and `a,b` are intentionally not exposed.
 
-Prefer `search_logs` for bounded operational log search. It accepts RFC3339 `start_time` and `end_time`, sorts by the Quickwit `timestamp_field` by default when present, and returns compact truncated hits.
+Prefer `search_logs` for bounded operational log search. It accepts RFC3339 `start_time` and `end_time`, sorts by the Quickwit `timestamp_field` by default when present, and returns compact truncated hits. You can pass `subject` with `subject_kind: "service"` to let the MCP server pick service-like fields from index metadata before building the Quickwit query; responses include `query_plan` when this path is used.
 
 Use `inspect_index` before searches to see Quickwit-native metadata: field names, `timestamp_field`, `default_search_fields`, and raw index metadata. The MCP server does not infer application-specific field meanings.
 
@@ -61,10 +61,11 @@ Example log search arguments:
 ```json
 {
   "index_id": "sample-index",
-  "text": "storage-api",
+  "subject": "Firehose",
+  "subject_kind": "service",
   "start_time": "2026-05-31T14:00:00Z",
   "end_time": "2026-05-31T15:00:00Z",
-  "max_hits": 20
+  "max_hits": 10
 }
 ```
 

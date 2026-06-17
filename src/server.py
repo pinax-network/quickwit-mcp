@@ -169,6 +169,9 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             start_time: str,
             end_time: str,
             text: str = "*",
+            subject: str | None = None,
+            subject_kind: str = "free_text",
+            auto_discover_fields: bool = True,
             fields: list[str] | None = None,
             sort_field: str | None = None,
             sort_order: str = "desc",
@@ -181,8 +184,15 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             inspection = _inspect_index_metadata(metadata)
             start_timestamp, end_timestamp, warnings = _parse_time_window(start_time, end_time, settings)
             timestamp_field = sort_field or _metadata_field_name(inspection, "timestamp_field")
+            query, query_plan = _build_auto_query(
+                base_query=_clean_query(text),
+                subject=subject,
+                subject_kind=subject_kind,
+                field_names=set(inspection["field_names"]),
+                auto_discover_fields=auto_discover_fields,
+            )
             body = _build_log_search_body(
-                query=_clean_query(text),
+                query=query,
                 start_timestamp=start_timestamp,
                 end_timestamp=end_timestamp,
                 max_hits=max_hits,
@@ -196,6 +206,7 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
                 truncate_field_bytes=truncate_field_bytes,
                 include_raw=include_raw,
                 warnings=warnings,
+                query_plan=query_plan,
             )
 
         @mcp.tool
@@ -405,6 +416,105 @@ def _build_log_search_body(
     }) or {}
 
 
+def _build_auto_query(
+    *,
+    base_query: str,
+    subject: str | None,
+    subject_kind: str,
+    field_names: set[str],
+    auto_discover_fields: bool,
+) -> tuple[str, dict[str, Any] | None]:
+    if subject is None or not str(subject).strip():
+        return base_query, None
+    if not isinstance(subject, str):
+        raise ToolError("subject must be a string")
+    if not isinstance(auto_discover_fields, bool):
+        raise ToolError("auto_discover_fields must be a boolean")
+
+    subject = subject.strip()
+    if len(subject) > 256:
+        raise ToolError("subject must be <= 256 characters")
+    if subject_kind not in {"free_text", "service"}:
+        raise ToolError("subject_kind must be 'free_text' or 'service'")
+
+    warnings = []
+    selected_fields: list[str] = []
+    if auto_discover_fields:
+        selected_fields = _select_subject_fields(field_names, subject_kind)
+        if subject_kind != "free_text" and not selected_fields:
+            warnings.append(f"no {subject_kind} fields found; used free-text subject search")
+
+    subject_clause = _format_subject_clause(subject, selected_fields)
+    query = _combine_queries(base_query, subject_clause)
+    return query, {
+        "base_query": base_query,
+        "subject": subject,
+        "subject_kind": subject_kind,
+        "auto_discover_fields": auto_discover_fields,
+        "selected_fields": selected_fields,
+        "query": query,
+        "warnings": warnings,
+    }
+
+
+def _select_subject_fields(field_names: set[str], subject_kind: str) -> list[str]:
+    if subject_kind != "service":
+        return []
+    scored = sorted(
+        ((field, _score_service_field(field)) for field in field_names if FIELD_NAME_PATTERN.fullmatch(field)),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return [field for field, score in scored if score > 0][:5]
+
+
+def _score_service_field(field_name: str) -> int:
+    normalized = field_name.lower().replace("_", ".")
+    exact_scores = {
+        "service.name": 100,
+        "service": 95,
+        "app": 85,
+        "application": 85,
+        "component": 75,
+        "k8s.container.name": 60,
+        "kubernetes.container.name": 60,
+        "k8s.deployment.name": 50,
+        "k8s.pod.name": 50,
+    }
+    if normalized in exact_scores:
+        return exact_scores[normalized]
+    if "service" in normalized:
+        return 70
+    return 0
+
+
+def _format_subject_clause(subject: str, fields: list[str]) -> str:
+    values = [subject]
+    lowered = subject.lower()
+    if lowered != subject:
+        values.append(lowered)
+
+    terms = [_format_query_value(value) for value in values]
+    if fields:
+        clauses = [f"{field}:{term}" for field in fields for term in terms]
+    else:
+        clauses = terms
+    if len(clauses) == 1:
+        return clauses[0]
+    return "(" + " OR ".join(clauses) + ")"
+
+
+def _format_query_value(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_]+", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _combine_queries(base_query: str, subject_clause: str) -> str:
+    if base_query == "*":
+        return subject_clause
+    return f"({base_query}) AND {subject_clause}"
+
+
 def _build_sort_by(sort_field: str | None, sort_order: str) -> list[str] | None:
     if sort_field is None:
         return None
@@ -421,6 +531,7 @@ def _compact_search_response(
     truncate_field_bytes: int,
     include_raw: bool,
     warnings: list[str],
+    query_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ToolError("Quickwit returned unexpected search response")
@@ -454,6 +565,8 @@ def _compact_search_response(
     }
     if include_raw:
         response["raw_response"] = result
+    if query_plan is not None:
+        response["query_plan"] = query_plan
     return response
 
 
