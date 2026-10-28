@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -85,6 +86,13 @@ logger = logging.getLogger(__name__)
 
 MCP_VERSION = __version__
 MCP_INSTANCE: FastMCP | None = None
+# Advertised to clients so they can allow these tools in unattended (read-only) contexts.
+READONLY_TOOL_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 HTTP_CLIENT: httpx.AsyncClient | None = None
 
 
@@ -139,12 +147,12 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
                 return PlainTextResponse(f"Quickwit unavailable: {exc}", status_code=503)
             return PlainTextResponse("OK")
 
-        @mcp.tool
+        @mcp.tool(annotations=READONLY_TOOL_ANNOTATIONS)
         async def version() -> dict[str, Any]:
             """Return Quickwit node version and runtime information."""
             return await quickwit_request(client, "GET", "/api/v1/version")
 
-        @mcp.tool
+        @mcp.tool(annotations=READONLY_TOOL_ANNOTATIONS)
         async def list_indexes() -> dict[str, list[dict[str, Any]]]:
             """List Quickwit indexes with summary and raw metadata."""
             metadata = await quickwit_request(client, "GET", "/api/v1/indexes")
@@ -152,13 +160,13 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
                 raise ToolError("Quickwit returned unexpected index metadata")
             return {"indexes": [_simplify_index_metadata(item) for item in metadata if isinstance(item, dict)]}
 
-        @mcp.tool
+        @mcp.tool(annotations=READONLY_TOOL_ANNOTATIONS)
         async def describe_index(index_id: str) -> dict[str, Any]:
             """Describe one Quickwit index."""
             _validate_index_id(index_id)
             return await quickwit_request(client, "GET", f"/api/v1/indexes/{index_id}/describe")
 
-        @mcp.tool
+        @mcp.tool(annotations=READONLY_TOOL_ANNOTATIONS)
         async def inspect_index(index_id: str) -> dict[str, Any]:
             """Inspect one exact Quickwit index before searching.
 
@@ -168,7 +176,7 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             metadata = await _get_index_metadata(client, index_id)
             return _inspect_index_metadata(metadata)
 
-        @mcp.tool
+        @mcp.tool(annotations=READONLY_TOOL_ANNOTATIONS)
         async def list_fields(
             index_id: str,
             field_patterns: list[str] | None = None,
@@ -193,7 +201,7 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             })
             return await quickwit_request(client, "GET", f"/api/v1/_elastic/{index_id}/_field_caps", params=params)
 
-        @mcp.tool
+        @mcp.tool(annotations=READONLY_TOOL_ANNOTATIONS)
         async def search_logs(
             index_id: str,
             start_time: str,
@@ -239,7 +247,7 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
                 query_plan=query_plan,
             )
 
-        @mcp.tool
+        @mcp.tool(annotations=READONLY_TOOL_ANNOTATIONS)
         async def search(
             index_id: str,
             query: str,
@@ -286,7 +294,7 @@ def create_mcp(client: httpx.AsyncClient, settings: Settings) -> FastMCP | None:
             })
             return await quickwit_request(client, "POST", f"/api/v1/{index_id}/search", json_body=body)
 
-        @mcp.tool
+        @mcp.tool(annotations=READONLY_TOOL_ANNOTATIONS)
         async def list_splits(
             index_id: str,
             offset: int = 0,

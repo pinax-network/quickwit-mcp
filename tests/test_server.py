@@ -129,6 +129,10 @@ async def test_create_mcp_exposes_only_curated_tools():
     assert "metrics" not in tool_names
     assert "debug" not in tool_names
     assert "node_config" not in tool_names
+    for tool in tools:
+        assert tool.annotations is not None, tool.name
+        assert tool.annotations.readOnlyHint is True, tool.name
+        assert tool.annotations.destructiveHint is False, tool.name
 
     await client.aclose()
 
